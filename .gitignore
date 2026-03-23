@@ -1,0 +1,16 @@
+.venv/
+.pyeditor-cache/
+.vscode/
+tools/
+
+!tools/
+!tools/README.md
+!tools/setup_ffmpeg.ps1
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+Thumbs.db
+Desktop.ini
