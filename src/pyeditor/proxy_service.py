@@ -8,6 +8,11 @@ from pathlib import Path
 from .ffmpeg_service import get_ffmpeg_binary
 
 
+PROXY_PROFILE_VERSION = "v3"
+PROXY_SCALE_FILTER = "scale=360:-2,fps=5"
+PROXY_CRF = "38"
+
+
 def get_proxy_cache_dir() -> Path:
     workspace_root = Path(__file__).resolve().parents[2]
     cache_dir = workspace_root / ".pyeditor-cache" / "proxies"
@@ -18,7 +23,7 @@ def get_proxy_cache_dir() -> Path:
 def get_cached_proxy_path(source_path: Path) -> Path:
     stat = source_path.stat()
     cache_key = hashlib.sha256(
-        f"{source_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
+        f"{PROXY_PROFILE_VERSION}|{source_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
     ).hexdigest()[:16]
     sanitized_stem = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in source_path.stem)
     file_name = f"{sanitized_stem}-{cache_key}.mp4"
@@ -49,13 +54,13 @@ def ensure_proxy(source_path: Path) -> Path:
         str(source_path),
         "-an",
         "-vf",
-        "scale=480:-2,fps=15",
+        PROXY_SCALE_FILTER,
         "-c:v",
         "libx264",
         "-preset",
         "ultrafast",
         "-crf",
-        "32",
+        PROXY_CRF,
         "-movflags",
         "+faststart",
         str(temp_proxy_path),

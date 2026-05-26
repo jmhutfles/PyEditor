@@ -69,7 +69,7 @@ This is intentionally simple and dependable for a first version.
 - Preview playback is video-only for now, which keeps trim marking responsive without needing a heavier media framework.
 - The app auto-detects bundled `ffmpeg.exe` and `ffprobe.exe` under the workspace `tools` folder before falling back to system `PATH`.
 - Rendering now exposes a determinate progress bar based on ffmpeg progress output.
-- Proxy previews are generated as low-resolution H.264 files to make clip scrubbing more responsive.
+- Proxy previews are generated as bare-bones H.264 files at 360p/5fps to keep proxy builds fast while preserving a larger picture.
 
 ## Git and Large Files
 
