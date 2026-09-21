@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
@@ -16,6 +17,13 @@ StatusCallback = Callable[[str], None]
 
 class FfmpegNotFoundError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class VideoProfile:
+    width: int
+    height: int
+    fps: float
 
 
 def ensure_ffmpeg_available() -> None:
@@ -68,6 +76,7 @@ def render_job(
 
     clip_durations = [max(clip.trim_duration or 0.0, 0.001) for clip in job.clips]
     total_trim_duration = sum(clip_durations)
+    target_profile = _build_target_profile(job.clips)
 
     def emit_status(message: str) -> None:
         if status_callback is not None:
@@ -90,6 +99,7 @@ def render_job(
             _render_segment(
                 clip,
                 segment_path,
+                target_profile=target_profile,
                 duration_seconds=clip_duration,
                 progress_callback=lambda fraction, base=completed_trim_duration, span=clip_duration: emit_progress(
                     0.9 * ((base + (span * fraction)) / total_trim_duration)
@@ -119,6 +129,7 @@ def render_job(
 def _render_segment(
     clip: ClipSegment,
     output_path: Path,
+    target_profile: VideoProfile,
     duration_seconds: float,
     progress_callback: ProgressCallback | None = None,
 ) -> None:
@@ -145,16 +156,28 @@ def _render_segment(
 
     command.extend(
         [
+            "-vf",
+            (
+                f"scale={target_profile.width}:{target_profile.height}:force_original_aspect_ratio=decrease,"
+                f"pad={target_profile.width}:{target_profile.height}:(ow-iw)/2:(oh-ih)/2:black,"
+                f"fps={_format_fps(target_profile.fps)},format=yuv420p,setsar=1"
+            ),
             "-c:v",
             "libx264",
             "-preset",
             "fast",
             "-crf",
             "18",
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
             "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
             "-movflags",
             "+faststart",
             str(output_path),
@@ -184,11 +207,93 @@ def _concat_segments(
         "0",
         "-i",
         str(concat_file),
-        "-c",
-        "copy",
+        "-vsync",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-movflags",
+        "+faststart",
         str(output_path),
     ]
     _run_ffmpeg_with_progress(command, duration_seconds, progress_callback)
+
+
+def _build_target_profile(clips: list[ClipSegment]) -> VideoProfile:
+    reference_profile = _probe_video_profile(clips[0].source_path)
+    width = _normalize_dimension(reference_profile.width)
+    height = _normalize_dimension(reference_profile.height)
+    fps = _normalize_fps(reference_profile.fps)
+
+    return VideoProfile(width=width, height=height, fps=fps)
+
+
+def _probe_video_profile(source_path: Path) -> VideoProfile:
+    command = [
+        _get_binary("ffprobe"),
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,avg_frame_rate,r_frame_rate",
+        "-of",
+        "json",
+        str(source_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    payload = json.loads(result.stdout)
+    streams = payload.get("streams", [])
+    if not streams:
+        raise RuntimeError(f"Could not read video stream information for {source_path}")
+
+    stream = streams[0]
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    fps = _parse_frame_rate(stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/0")
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Could not determine video dimensions for {source_path}")
+
+    return VideoProfile(width=width, height=height, fps=fps)
+
+
+def _parse_frame_rate(value: str) -> float:
+    numerator_text, denominator_text = value.split("/", 1)
+    numerator = float(numerator_text)
+    denominator = float(denominator_text)
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
+
+
+def _normalize_dimension(value: int) -> int:
+    normalized = max(2, value)
+    if normalized % 2 == 1:
+        normalized += 1
+    return normalized
+
+
+def _normalize_fps(value: float) -> float:
+    if value <= 0:
+        return 30.0
+    return min(max(value, 24.0), 60.0)
+
+
+def _format_fps(value: float) -> str:
+    return f"{value:.3f}".rstrip("0").rstrip(".")
 
 
 def _format_timestamp(value: float) -> str:

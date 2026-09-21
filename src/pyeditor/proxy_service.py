@@ -50,6 +50,10 @@ def ensure_proxy(source_path: Path) -> Path:
     command = [
         get_ffmpeg_binary(),
         "-y",
+        "-threads",
+        "0",
+        "-filter_threads",
+        "0",
         "-i",
         str(source_path),
         "-an",

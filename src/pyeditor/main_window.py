@@ -13,7 +13,7 @@ except ImportError:
     TkinterDnD = None
 
 from .ffmpeg_service import FfmpegNotFoundError, probe_duration
-from .models import ClipSegment, RenderJob
+from .models import ClipSegment, RenderJob, SourceClip
 from .preview_player import PreviewPlayer
 from .proxy_service import find_existing_proxy
 from .proxy_worker import ProxyController
@@ -31,6 +31,7 @@ class MainWindow:
         self.root.title("PyEditor")
         self.root.geometry("1280x820")
 
+        self.source_clips: list[SourceClip] = []
         self.current_clips: list[ClipSegment] = []
         self.queued_outputs: set[Path] = set()
         self.queue_rows: dict[str, int] = {}
@@ -40,7 +41,7 @@ class MainWindow:
         self.preview_image: ImageTk.PhotoImage | None = None
         self._updating_playhead = False
 
-        self.selected_clip_name_var = tk.StringVar(value="No clip selected")
+        self.selected_clip_name_var = tk.StringVar(value="No source selected")
         self.selected_clip_duration_var = tk.StringVar(value="-")
         self.start_var = tk.StringVar(value="0.000")
         self.end_var = tk.StringVar(value="0.000")
@@ -68,20 +69,59 @@ class MainWindow:
         self.root.mainloop()
 
     def _build_ui(self) -> None:
-        self.root.columnconfigure(0, weight=3)
-        self.root.columnconfigure(1, weight=2)
+        self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        left_frame = ttk.Frame(self.root, padding=16)
-        right_frame = ttk.Frame(self.root, padding=16)
+        content_shell = ttk.Frame(self.root)
+        content_shell.grid(row=0, column=0, sticky="nsew")
+        content_shell.columnconfigure(0, weight=1)
+        content_shell.rowconfigure(0, weight=1)
+
+        self.content_canvas = tk.Canvas(content_shell, highlightthickness=0)
+        content_scrollbar = ttk.Scrollbar(content_shell, orient="vertical", command=self.content_canvas.yview)
+        self.content_canvas.configure(yscrollcommand=content_scrollbar.set)
+        self.content_canvas.grid(row=0, column=0, sticky="nsew")
+        content_scrollbar.grid(row=0, column=1, sticky="ns")
+
+        content_frame = ttk.Frame(self.content_canvas)
+        content_frame.columnconfigure(0, weight=3)
+        content_frame.columnconfigure(1, weight=2)
+        self._content_window = self.content_canvas.create_window((0, 0), window=content_frame, anchor="nw")
+        content_frame.bind("<Configure>", self._sync_scroll_region)
+        self.content_canvas.bind("<Configure>", self._resize_scroll_content)
+
+        left_frame = ttk.Frame(content_frame, padding=16)
+        right_frame = ttk.Frame(content_frame, padding=16)
         left_frame.grid(row=0, column=0, sticky="nsew")
         right_frame.grid(row=0, column=1, sticky="nsew")
 
         self._build_edit_panel(left_frame)
         self._build_queue_panel(right_frame)
+        self._bind_scroll_events(content_frame)
 
         status_bar = ttk.Label(self.root, textvariable=self.status_var, anchor="w", padding=(16, 8))
-        status_bar.grid(row=1, column=0, columnspan=2, sticky="ew")
+        status_bar.grid(row=1, column=0, sticky="ew")
+
+    def _sync_scroll_region(self, _event: tk.Event) -> None:
+        self.content_canvas.configure(scrollregion=self.content_canvas.bbox("all"))
+
+    def _resize_scroll_content(self, event: tk.Event) -> None:
+        self.content_canvas.itemconfigure(self._content_window, width=event.width)
+
+    def _bind_scroll_events(self, widget: tk.Misc) -> None:
+        widget.bind("<Enter>", self._enable_mousewheel_scrolling)
+        widget.bind("<Leave>", self._disable_mousewheel_scrolling)
+        for child in widget.winfo_children():
+            self._bind_scroll_events(child)
+
+    def _enable_mousewheel_scrolling(self, _event: tk.Event) -> None:
+        self.content_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _disable_mousewheel_scrolling(self, _event: tk.Event) -> None:
+        self.content_canvas.unbind_all("<MouseWheel>")
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        self.content_canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def _build_edit_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -96,7 +136,7 @@ class MainWindow:
         ).pack(anchor="w")
         ttk.Label(
             header,
-            text="Load clips, trim them with start/end times, then queue the edit for rendering.",
+            text="Load source clips, mark ranges in preview, and add those ranges to the edit segments list.",
         ).pack(anchor="w", pady=(4, 0))
 
         preview_box = ttk.LabelFrame(parent, text="Preview", padding=12)
@@ -132,34 +172,62 @@ class MainWindow:
         ttk.Button(preview_controls, text="Jump To In", command=lambda: self._jump_to_trim_edge("start")).pack(side="left", padx=(8, 0))
         ttk.Button(preview_controls, text="Jump To Out", command=lambda: self._jump_to_trim_edge("end")).pack(side="left", padx=(8, 0))
 
-        clips_box = ttk.LabelFrame(parent, text="Clips", padding=12)
-        clips_box.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
-        clips_box.columnconfigure(0, weight=1)
-        clips_box.rowconfigure(1, weight=1)
+        media_frame = ttk.Frame(parent)
+        media_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        media_frame.columnconfigure(0, weight=1)
+        media_frame.columnconfigure(1, weight=1)
+        media_frame.rowconfigure(0, weight=1)
 
-        button_row = ttk.Frame(clips_box)
-        button_row.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        ttk.Button(button_row, text="Add Clips", command=self._add_clips).pack(side="left")
-        ttk.Button(button_row, text="Remove", command=self._remove_selected_clip).pack(side="left", padx=(8, 0))
-        ttk.Button(button_row, text="Move Up", command=lambda: self._move_selected_clip(-1)).pack(side="left", padx=(8, 0))
-        ttk.Button(button_row, text="Move Down", command=lambda: self._move_selected_clip(1)).pack(side="left", padx=(8, 0))
+        sources_box = ttk.LabelFrame(media_frame, text="Source Clips", padding=12)
+        sources_box.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        sources_box.columnconfigure(0, weight=1)
+        sources_box.rowconfigure(2, weight=1)
 
-        ttk.Label(clips_box, textvariable=self.drop_hint_var).grid(row=1, column=0, sticky="w", pady=(0, 8))
+        source_button_row = ttk.Frame(sources_box)
+        source_button_row.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        ttk.Button(source_button_row, text="Add Clips", command=self._add_clips).pack(side="left")
+        ttk.Button(source_button_row, text="Remove Source", command=self._remove_selected_source).pack(side="left", padx=(8, 0))
 
-        list_frame = ttk.Frame(clips_box)
-        list_frame.grid(row=2, column=0, sticky="nsew")
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
+        ttk.Label(sources_box, textvariable=self.drop_hint_var).grid(row=1, column=0, sticky="w", pady=(0, 8))
 
-        self.clip_listbox = tk.Listbox(list_frame, exportselection=False, height=16)
+        source_list_frame = ttk.Frame(sources_box)
+        source_list_frame.grid(row=2, column=0, sticky="nsew")
+        source_list_frame.columnconfigure(0, weight=1)
+        source_list_frame.rowconfigure(0, weight=1)
+
+        self.source_listbox = tk.Listbox(source_list_frame, exportselection=False, height=12)
+        self.source_listbox.grid(row=0, column=0, sticky="nsew")
+        self.source_listbox.bind("<<ListboxSelect>>", self._on_source_selected)
+        source_scrollbar = ttk.Scrollbar(source_list_frame, orient="vertical", command=self.source_listbox.yview)
+        source_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.source_listbox.configure(yscrollcommand=source_scrollbar.set)
+        self._configure_drag_and_drop(sources_box, source_list_frame)
+
+        segments_box = ttk.LabelFrame(media_frame, text="Edit Segments", padding=12)
+        segments_box.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        segments_box.columnconfigure(0, weight=1)
+        segments_box.rowconfigure(1, weight=1)
+
+        segment_button_row = ttk.Frame(segments_box)
+        segment_button_row.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        ttk.Button(segment_button_row, text="Add Segment", command=self._add_segment_from_source).pack(side="left")
+        ttk.Button(segment_button_row, text="Remove Segment", command=self._remove_selected_clip).pack(side="left", padx=(8, 0))
+        ttk.Button(segment_button_row, text="Move Up", command=lambda: self._move_selected_clip(-1)).pack(side="left", padx=(8, 0))
+        ttk.Button(segment_button_row, text="Move Down", command=lambda: self._move_selected_clip(1)).pack(side="left", padx=(8, 0))
+
+        segment_list_frame = ttk.Frame(segments_box)
+        segment_list_frame.grid(row=1, column=0, sticky="nsew")
+        segment_list_frame.columnconfigure(0, weight=1)
+        segment_list_frame.rowconfigure(0, weight=1)
+
+        self.clip_listbox = tk.Listbox(segment_list_frame, exportselection=False, height=12)
         self.clip_listbox.grid(row=0, column=0, sticky="nsew")
         self.clip_listbox.bind("<<ListboxSelect>>", self._on_clip_selected)
-        clips_scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.clip_listbox.yview)
+        clips_scrollbar = ttk.Scrollbar(segment_list_frame, orient="vertical", command=self.clip_listbox.yview)
         clips_scrollbar.grid(row=0, column=1, sticky="ns")
         self.clip_listbox.configure(yscrollcommand=clips_scrollbar.set)
-        self._configure_drag_and_drop(clips_box, list_frame)
 
-        trim_box = ttk.LabelFrame(parent, text="Selected Clip", padding=12)
+        trim_box = ttk.LabelFrame(parent, text="Current Range", padding=12)
         trim_box.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         trim_box.columnconfigure(1, weight=1)
 
@@ -177,7 +245,8 @@ class MainWindow:
 
         trim_button_row = ttk.Frame(trim_box)
         trim_button_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        ttk.Button(trim_button_row, text="Apply Trim", command=self._apply_trim_values).pack(side="left")
+        ttk.Button(trim_button_row, text="Add Segment", command=self._add_segment_from_source).pack(side="left")
+        ttk.Button(trim_button_row, text="Update Segment", command=self._apply_trim_values).pack(side="left", padx=(8, 0))
         ttk.Button(trim_button_row, text="Use Full Clip", command=self._use_full_clip).pack(side="left", padx=(8, 0))
 
         output_box = ttk.LabelFrame(parent, text="Output", padding=12)
@@ -275,10 +344,8 @@ class MainWindow:
                 messagebox.showerror("Clip load failed", str(exc), parent=self.root)
                 return
 
-            clip = ClipSegment(
+            clip = SourceClip(
                 source_path=clip_path,
-                start_seconds=0.0,
-                end_seconds=duration_seconds,
                 duration_seconds=duration_seconds,
             )
             existing_proxy = find_existing_proxy(clip_path)
@@ -288,8 +355,8 @@ class MainWindow:
             else:
                 clip.proxy_status = "queued"
                 self.proxy_controller.enqueue(str(clip_path))
-            self.current_clips.append(clip)
-            self.clip_listbox.insert(tk.END, self._format_clip_item_text(clip))
+            self.source_clips.append(clip)
+            self.source_listbox.insert(tk.END, self._format_source_item_text(clip))
             added_any = True
 
         if not added_any:
@@ -300,12 +367,12 @@ class MainWindow:
             )
             return
 
-        if self.clip_listbox.curselection() == () and self.current_clips:
-            self.clip_listbox.selection_set(0)
-            self._load_selected_clip(0)
+        if self.source_listbox.curselection() == () and self.source_clips:
+            self.source_listbox.selection_set(0)
+            self._load_selected_source(0)
 
-        if not self.output_path_var.get() and self.current_clips:
-            suggested_path = self.current_clips[0].source_path.with_name("edit-output.mp4")
+        if not self.output_path_var.get() and self.source_clips:
+            suggested_path = self.source_clips[0].source_path.with_name("edit-output.mp4")
             self.output_path_var.set(str(suggested_path))
 
     def _configure_drag_and_drop(self, *widgets: tk.Misc) -> None:
@@ -322,6 +389,26 @@ class MainWindow:
         self._add_clip_paths(dropped_items)
         return "break"
 
+    def _remove_selected_source(self) -> None:
+        row = self._selected_source_index()
+        if row is None:
+            return
+
+        source = self.source_clips.pop(row)
+        self.source_listbox.delete(row)
+        self.current_clips = [clip for clip in self.current_clips if clip.source_path != source.source_path]
+        self._refresh_clip_list_text()
+
+        if self.source_clips:
+            next_row = min(row, len(self.source_clips) - 1)
+            self.source_listbox.selection_set(next_row)
+            self._load_selected_source(next_row)
+        elif self.current_clips:
+            self.clip_listbox.selection_set(0)
+            self._load_selected_clip(0)
+        else:
+            self._clear_clip_selection()
+
     def _remove_selected_clip(self) -> None:
         row = self._selected_clip_index()
         if row is None:
@@ -333,6 +420,12 @@ class MainWindow:
             next_row = min(row, len(self.current_clips) - 1)
             self.clip_listbox.selection_set(next_row)
             self._load_selected_clip(next_row)
+        elif self.source_clips:
+            source_row = self._selected_source_index()
+            if source_row is None:
+                source_row = 0
+                self.source_listbox.selection_set(source_row)
+            self._load_selected_source(source_row)
         else:
             self._clear_clip_selection()
 
@@ -351,23 +444,54 @@ class MainWindow:
         self.clip_listbox.selection_set(new_row)
         self._load_selected_clip(new_row)
 
+    def _on_source_selected(self, _event: tk.Event[tk.Misc]) -> None:
+        row = self._selected_source_index()
+        if row is None:
+            if self._selected_clip_index() is None:
+                self._clear_clip_selection()
+            return
+        self.clip_listbox.selection_clear(0, tk.END)
+        self._load_selected_source(row)
+
     def _on_clip_selected(self, _event: tk.Event[tk.Misc]) -> None:
         row = self._selected_clip_index()
         if row is None:
-            self._clear_clip_selection()
+            source_row = self._selected_source_index()
+            if source_row is None:
+                self._clear_clip_selection()
+                return
+            self._load_selected_source(source_row)
             return
         self._load_selected_clip(row)
 
+    def _load_selected_source(self, row: int) -> None:
+        clip = self.source_clips[row]
+        self.selected_clip_name_var.set(clip.display_name)
+        self.selected_clip_duration_var.set(_format_seconds(clip.duration_seconds or 0.0))
+        self.start_var.set("0.000")
+        self.end_var.set(f"{(clip.duration_seconds or 0.0):.3f}")
+        self._load_preview_for_clip(clip)
+
     def _load_selected_clip(self, row: int) -> None:
         clip = self.current_clips[row]
+        source_row = self._find_source_index(clip.source_path)
+        if source_row is not None:
+            self.source_listbox.selection_clear(0, tk.END)
+            self.source_listbox.selection_set(source_row)
+            self.source_listbox.see(source_row)
         self.selected_clip_name_var.set(clip.display_name)
         self.selected_clip_duration_var.set(_format_seconds(clip.duration_seconds or 0.0))
         self.start_var.set(f"{clip.start_seconds:.3f}")
         self.end_var.set(f"{(clip.effective_end or 0.0):.3f}")
-        self._load_preview_for_clip(clip)
+        preview_source = self._selected_source()
+        if preview_source is not None:
+            self._load_preview_for_clip(preview_source)
+            self._seek_preview(clip.start_seconds)
+        else:
+            self._load_preview_for_clip(clip)
 
     def _clear_clip_selection(self) -> None:
-        self.selected_clip_name_var.set("No clip selected")
+        self.selected_clip_name_var.set("No source selected")
         self.selected_clip_duration_var.set("-")
         self.start_var.set("0.000")
         self.end_var.set("0.000")
@@ -382,8 +506,13 @@ class MainWindow:
 
     def _apply_trim_values(self) -> None:
         clip = self._selected_clip()
-        if clip is None:
-            messagebox.showwarning("No clip selected", "Select a clip first.", parent=self.root)
+        source = self._selected_source()
+        if clip is None or source is None:
+            messagebox.showwarning(
+                "No segment selected",
+                "Select an edit segment to update, or choose a source clip and click Add Segment.",
+                parent=self.root,
+            )
             return
 
         try:
@@ -393,25 +522,70 @@ class MainWindow:
             messagebox.showwarning("Invalid trim", "Start and end must be numbers.", parent=self.root)
             return
 
-        clip_duration = clip.duration_seconds or 0.0
+        clip_duration = source.duration_seconds or 0.0
         start_seconds = max(0.0, min(start_seconds, clip_duration))
         end_seconds = max(start_seconds, min(end_seconds, clip_duration))
 
         clip.start_seconds = start_seconds
         clip.end_seconds = end_seconds
+        clip.duration_seconds = source.duration_seconds
+        clip.proxy_path = source.proxy_path
+        clip.proxy_status = source.proxy_status
+        clip.proxy_error = source.proxy_error
         self.start_var.set(f"{start_seconds:.3f}")
         self.end_var.set(f"{end_seconds:.3f}")
         self._refresh_clip_list_text()
 
-    def _use_full_clip(self) -> None:
-        clip = self._selected_clip()
-        if clip is None:
+    def _add_segment_from_source(self) -> None:
+        source = self._selected_source()
+        if source is None:
+            messagebox.showwarning("No source selected", "Select a source clip first.", parent=self.root)
             return
-        clip.start_seconds = 0.0
-        clip.end_seconds = clip.duration_seconds
-        self.start_var.set("0.000")
-        self.end_var.set(f"{(clip.duration_seconds or 0.0):.3f}")
+
+        try:
+            start_seconds = float(self.start_var.get())
+            end_seconds = float(self.end_var.get())
+        except ValueError:
+            messagebox.showwarning("Invalid trim", "Start and end must be numbers.", parent=self.root)
+            return
+
+        clip_duration = source.duration_seconds or 0.0
+        start_seconds = max(0.0, min(start_seconds, clip_duration))
+        end_seconds = max(start_seconds, min(end_seconds, clip_duration))
+
+        clip = ClipSegment(
+            source_path=source.source_path,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+            duration_seconds=source.duration_seconds,
+            proxy_path=source.proxy_path,
+            proxy_status=source.proxy_status,
+            proxy_error=source.proxy_error,
+        )
+        insert_row = self._selected_clip_index()
+        if insert_row is None:
+            insert_row = len(self.current_clips)
+        else:
+            insert_row += 1
+        self.current_clips.insert(insert_row, clip)
         self._refresh_clip_list_text()
+        self.clip_listbox.selection_clear(0, tk.END)
+        self.clip_listbox.selection_set(insert_row)
+        self._load_selected_clip(insert_row)
+
+    def _use_full_clip(self) -> None:
+        source = self._selected_source()
+        if source is None:
+            return
+
+        self.start_var.set("0.000")
+        self.end_var.set(f"{(source.duration_seconds or 0.0):.3f}")
+
+        clip = self._selected_clip()
+        if clip is not None:
+            clip.start_seconds = 0.0
+            clip.end_seconds = source.duration_seconds
+            self._refresh_clip_list_text()
 
     def _choose_output_path(self) -> None:
         output_path_text = filedialog.asksaveasfilename(
@@ -422,7 +596,7 @@ class MainWindow:
         if output_path_text:
             self.output_path_var.set(output_path_text)
 
-    def _load_preview_for_clip(self, clip: ClipSegment) -> None:
+    def _load_preview_for_clip(self, clip: SourceClip | ClipSegment) -> None:
         try:
             image = self.preview_player.load_clip(clip.preview_path, clip.duration_seconds or 0.0)
         except Exception as exc:  # noqa: BLE001
@@ -440,7 +614,7 @@ class MainWindow:
         self._seek_preview(clip.start_seconds)
 
     def _toggle_preview_playback(self) -> None:
-        if self._selected_clip() is None:
+        if self._selected_source() is None and self._selected_clip() is None:
             return
 
         self.preview_player.toggle()
@@ -486,29 +660,41 @@ class MainWindow:
         self.preview_duration_var.set(_format_seconds(duration_seconds))
 
     def _set_start_from_playhead(self) -> None:
-        clip = self._selected_clip()
-        if clip is None:
+        source = self._selected_source()
+        if source is None:
             return
 
-        clip.start_seconds = min(self.preview_player.playhead_seconds, clip.effective_end or self.preview_player.playhead_seconds)
-        self.start_var.set(f"{clip.start_seconds:.3f}")
-        self._refresh_clip_list_text()
+        try:
+            end_seconds = float(self.end_var.get())
+        except ValueError:
+            end_seconds = source.duration_seconds or self.preview_player.playhead_seconds
+
+        start_seconds = min(self.preview_player.playhead_seconds, end_seconds)
+        self.start_var.set(f"{start_seconds:.3f}")
 
     def _set_end_from_playhead(self) -> None:
-        clip = self._selected_clip()
-        if clip is None:
+        source = self._selected_source()
+        if source is None:
             return
 
-        clip.end_seconds = max(self.preview_player.playhead_seconds, clip.start_seconds)
-        self.end_var.set(f"{clip.end_seconds:.3f}")
-        self._refresh_clip_list_text()
+        try:
+            start_seconds = float(self.start_var.get())
+        except ValueError:
+            start_seconds = 0.0
+
+        end_seconds = min(max(self.preview_player.playhead_seconds, start_seconds), source.duration_seconds or self.preview_player.playhead_seconds)
+        self.end_var.set(f"{end_seconds:.3f}")
 
     def _jump_to_trim_edge(self, edge: str) -> None:
-        clip = self._selected_clip()
-        if clip is None:
+        source = self._selected_source()
+        if source is None and self._selected_clip() is None:
             return
 
-        target_seconds = clip.start_seconds if edge == "start" else (clip.effective_end or 0.0)
+        try:
+            target_seconds = float(self.start_var.get()) if edge == "start" else float(self.end_var.get())
+        except ValueError:
+            target_seconds = 0.0
+
         self.preview_player.pause()
         self.play_pause_button.configure(text="Play")
         self.preview_state_var.set("Paused")
@@ -517,7 +703,7 @@ class MainWindow:
     def _queue_current_job(self) -> None:
         output_path_text = self.output_path_var.get().strip()
         if not self.current_clips:
-            messagebox.showwarning("Nothing to queue", "Add at least one clip first.", parent=self.root)
+            messagebox.showwarning("Nothing to queue", "Add at least one segment first.", parent=self.root)
             return
         if not output_path_text:
             messagebox.showwarning("Missing output", "Choose an output file first.", parent=self.root)
@@ -557,8 +743,7 @@ class MainWindow:
         self.status_var.set(f"Queued {output_path.name}")
 
     def _apply_trim_values_if_possible(self) -> None:
-        row = self._selected_clip_index()
-        if row is None:
+        if self._selected_clip_index() is None:
             return
         try:
             self._apply_trim_values()
@@ -569,7 +754,14 @@ class MainWindow:
         self.current_clips.clear()
         self.clip_listbox.delete(0, tk.END)
         self.output_path_var.set("")
-        self._clear_clip_selection()
+        if self.source_clips:
+            source_row = self._selected_source_index()
+            if source_row is None:
+                source_row = 0
+                self.source_listbox.selection_set(source_row)
+            self._load_selected_source(source_row)
+        else:
+            self._clear_clip_selection()
 
     def _start_render_queue(self) -> None:
         if not self.render_controller.has_pending_jobs() and not self.render_controller.is_running:
@@ -579,6 +771,18 @@ class MainWindow:
         self.render_controller.start()
         self.start_queue_button.configure(state="disabled")
         self.status_var.set("Rendering queue")
+
+    def _selected_source_index(self) -> int | None:
+        selection = self.source_listbox.curselection()
+        if not selection:
+            return None
+        return int(selection[0])
+
+    def _selected_source(self) -> SourceClip | None:
+        row = self._selected_source_index()
+        if row is None:
+            return None
+        return self.source_clips[row]
 
     def _selected_clip_index(self) -> int | None:
         selection = self.clip_listbox.curselection()
@@ -600,12 +804,24 @@ class MainWindow:
         if selected_row is not None and selected_row < len(self.current_clips):
             self.clip_listbox.selection_set(selected_row)
 
+    def _refresh_source_list_text(self) -> None:
+        selected_row = self._selected_source_index()
+        self.source_listbox.delete(0, tk.END)
+        for clip in self.source_clips:
+            self.source_listbox.insert(tk.END, self._format_source_item_text(clip))
+        if selected_row is not None and selected_row < len(self.source_clips):
+            self.source_listbox.selection_set(selected_row)
+
     def _format_clip_item_text(self, clip: ClipSegment) -> str:
         proxy_marker = " [proxy]" if clip.proxy_path is not None else ""
         return (
             f"{clip.display_name}{proxy_marker} | "
             f"{_format_seconds(clip.start_seconds)} -> {_format_seconds(clip.effective_end or 0.0)}"
         )
+
+    def _format_source_item_text(self, clip: SourceClip) -> str:
+        proxy_marker = " [proxy]" if clip.proxy_path is not None else ""
+        return f"{clip.display_name}{proxy_marker} | {_format_seconds(clip.duration_seconds or 0.0)}"
 
     def _format_proxy_status(self, clip: ClipSegment) -> str:
         if clip.proxy_status == "ready" and clip.proxy_path is not None:
@@ -712,23 +928,28 @@ class MainWindow:
         self.queue_listbox.insert(row, f"{state} | {output_name}")
 
     def _on_proxy_started(self, source_path_text: str) -> None:
-        clip = self._find_clip_by_source(Path(source_path_text))
+        clip = self._find_source_by_path(Path(source_path_text))
         if clip is None:
             return
         clip.proxy_status = "building"
         clip.proxy_error = None
-        if clip == self._selected_clip():
+        self._sync_segments_for_source(clip)
+        self._refresh_source_list_text()
+        self._refresh_clip_list_text()
+        if clip == self._selected_source():
             self.proxy_status_var.set(self._format_proxy_status(clip))
 
     def _on_proxy_finished(self, source_path_text: str, proxy_path_text: str) -> None:
-        clip = self._find_clip_by_source(Path(source_path_text))
+        clip = self._find_source_by_path(Path(source_path_text))
         if clip is None:
             return
         clip.proxy_path = Path(proxy_path_text)
         clip.proxy_status = "ready"
         clip.proxy_error = None
+        self._sync_segments_for_source(clip)
+        self._refresh_source_list_text()
         self._refresh_clip_list_text()
-        if clip == self._selected_clip():
+        if clip == self._selected_source():
             current_position = self.preview_player.playhead_seconds
             was_playing = self.preview_player.is_playing
             self._load_preview_for_clip(clip)
@@ -739,20 +960,38 @@ class MainWindow:
                 self.preview_state_var.set("Playing")
 
     def _on_proxy_failed(self, source_path_text: str, error: str) -> None:
-        clip = self._find_clip_by_source(Path(source_path_text))
+        clip = self._find_source_by_path(Path(source_path_text))
         if clip is None:
             return
         clip.proxy_status = "failed"
         clip.proxy_error = error
-        if clip == self._selected_clip():
+        self._sync_segments_for_source(clip)
+        self._refresh_source_list_text()
+        self._refresh_clip_list_text()
+        if clip == self._selected_source():
             self.proxy_status_var.set(self._format_proxy_status(clip))
         self._append_log(f"Proxy build failed for {clip.display_name}: {error}")
 
-    def _find_clip_by_source(self, source_path: Path) -> ClipSegment | None:
-        for clip in self.current_clips:
+    def _find_source_by_path(self, source_path: Path) -> SourceClip | None:
+        for clip in self.source_clips:
             if clip.source_path == source_path:
                 return clip
         return None
+
+    def _find_source_index(self, source_path: Path) -> int | None:
+        for index, clip in enumerate(self.source_clips):
+            if clip.source_path == source_path:
+                return index
+        return None
+
+    def _sync_segments_for_source(self, source: SourceClip) -> None:
+        for clip in self.current_clips:
+            if clip.source_path != source.source_path:
+                continue
+            clip.duration_seconds = source.duration_seconds
+            clip.proxy_path = source.proxy_path
+            clip.proxy_status = source.proxy_status
+            clip.proxy_error = source.proxy_error
 
     def _on_close(self) -> None:
         self.preview_player.release()
