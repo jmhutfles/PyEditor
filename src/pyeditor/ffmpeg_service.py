@@ -26,6 +26,12 @@ class VideoProfile:
     fps: float
 
 
+@dataclass(frozen=True, slots=True)
+class EncoderProfile:
+    label: str
+    args: tuple[str, ...]
+
+
 def ensure_ffmpeg_available() -> None:
     if _resolve_binary("ffmpeg") is None or _resolve_binary("ffprobe") is None:
         raise FfmpegNotFoundError(
@@ -77,6 +83,7 @@ def render_job(
     clip_durations = [max(clip.trim_duration or 0.0, 0.001) for clip in job.clips]
     total_trim_duration = sum(clip_durations)
     target_profile = _build_target_profile(job.clips)
+    encoder_profile = _resolve_encoder_profile(job.video_backend)
 
     def emit_status(message: str) -> None:
         if status_callback is not None:
@@ -95,11 +102,12 @@ def render_job(
 
         for index, (clip, clip_duration) in enumerate(zip(job.clips, clip_durations, strict=False), start=1):
             segment_path = temp_dir / f"segment_{index:03d}.mp4"
-            emit_status(f"Trimming {clip.display_name} -> {segment_path.name}")
+            emit_status(f"Trimming {clip.display_name} -> {segment_path.name} [{encoder_profile.label}]")
             _render_segment(
                 clip,
                 segment_path,
                 target_profile=target_profile,
+                encoder_profile=encoder_profile,
                 duration_seconds=clip_duration,
                 progress_callback=lambda fraction, base=completed_trim_duration, span=clip_duration: emit_progress(
                     0.9 * ((base + (span * fraction)) / total_trim_duration)
@@ -115,10 +123,11 @@ def render_job(
             encoding="utf-8",
         )
 
-        emit_status(f"Concatenating {len(segment_files)} segments into {job.output_path.name}")
+        emit_status(f"Concatenating {len(segment_files)} segments into {job.output_path.name} [{encoder_profile.label}]")
         _concat_segments(
             concat_file,
             job.output_path,
+            encoder_profile=encoder_profile,
             duration_seconds=total_trim_duration,
             progress_callback=lambda fraction: emit_progress(0.9 + (0.1 * fraction)),
         )
@@ -130,6 +139,7 @@ def _render_segment(
     clip: ClipSegment,
     output_path: Path,
     target_profile: VideoProfile,
+    encoder_profile: EncoderProfile,
     duration_seconds: float,
     progress_callback: ProgressCallback | None = None,
 ) -> None:
@@ -162,14 +172,7 @@ def _render_segment(
                 f"pad={target_profile.width}:{target_profile.height}:(ow-iw)/2:(oh-ih)/2:black,"
                 f"fps={_format_fps(target_profile.fps)},format=yuv420p,setsar=1"
             ),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
+            *encoder_profile.args,
             "-c:a",
             "aac",
             "-b:a",
@@ -190,6 +193,7 @@ def _render_segment(
 def _concat_segments(
     concat_file: Path,
     output_path: Path,
+    encoder_profile: EncoderProfile,
     duration_seconds: float,
     progress_callback: ProgressCallback | None = None,
 ) -> None:
@@ -209,14 +213,7 @@ def _concat_segments(
         str(concat_file),
         "-vsync",
         "cfr",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-crf",
-        "18",
-        "-pix_fmt",
-        "yuv420p",
+        *encoder_profile.args,
         "-c:a",
         "aac",
         "-b:a",
@@ -239,6 +236,76 @@ def _build_target_profile(clips: list[ClipSegment]) -> VideoProfile:
     fps = _normalize_fps(reference_profile.fps)
 
     return VideoProfile(width=width, height=height, fps=fps)
+
+
+def _resolve_encoder_profile(video_backend: str) -> EncoderProfile:
+    normalized = video_backend.strip().lower()
+    if normalized == "nvidia":
+        if _encoder_available("h264_nvenc"):
+            return EncoderProfile(
+                label="NVIDIA NVENC",
+                args=(
+                    "-c:v",
+                    "h264_nvenc",
+                    "-preset",
+                    "p5",
+                    "-cq",
+                    "19",
+                    "-rc",
+                    "vbr",
+                    "-b:v",
+                    "0",
+                    "-pix_fmt",
+                    "yuv420p",
+                ),
+            )
+        raise RuntimeError("NVIDIA NVENC was requested but h264_nvenc is not available in this ffmpeg build.")
+
+    if normalized == "cpu":
+        return EncoderProfile(
+            label="CPU x264",
+            args=("-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"),
+        )
+
+    if _encoder_available("h264_nvenc"):
+        return EncoderProfile(
+            label="NVIDIA NVENC",
+            args=(
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p5",
+                "-cq",
+                "19",
+                "-rc",
+                "vbr",
+                "-b:v",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+            ),
+        )
+
+    return EncoderProfile(
+        label="CPU x264",
+        args=("-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p"),
+    )
+
+
+@lru_cache(maxsize=1)
+def _available_encoders() -> set[str]:
+    command = [_get_binary("ffmpeg"), "-hide_banner", "-encoders"]
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    encoders: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith(("V", "A", "S")):
+            encoders.add(parts[1])
+    return encoders
+
+
+def _encoder_available(name: str) -> bool:
+    return name in _available_encoders()
 
 
 def _probe_video_profile(source_path: Path) -> VideoProfile:

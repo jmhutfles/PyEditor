@@ -64,6 +64,7 @@ class ClipSegment:
 class RenderJob:
     output_path: Path
     clips: List[ClipSegment] = field(default_factory=list)
+    video_backend: str = "auto"
 
     @property
     def label(self) -> str:
