@@ -37,6 +37,10 @@ class MainWindow:
         self.preview_player = PreviewPlayer()
         self.preview_image: ImageTk.PhotoImage | None = None
         self._updating_playhead = False
+        self._scrubbing_preview = False
+        self._resume_preview_after_scrub = False
+        self._pending_seek_seconds: float | None = None
+        self._pending_seek_after_id: str | None = None
         self._preview_height = 360
         self._preview_resize_start_y = 0
         self._preview_resize_start_height = self._preview_height
@@ -220,6 +224,8 @@ class MainWindow:
             command=self._on_playhead_changed,
         )
         self.playhead_scale.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        self.playhead_scale.bind("<ButtonPress-1>", self._on_playhead_press)
+        self.playhead_scale.bind("<ButtonRelease-1>", self._on_playhead_release)
 
         preview_info_row = ttk.Frame(preview_box)
         preview_info_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
@@ -582,6 +588,9 @@ class MainWindow:
             self._load_preview_for_clip(clip)
 
     def _clear_clip_selection(self) -> None:
+        self._cancel_pending_seek()
+        self._scrubbing_preview = False
+        self._resume_preview_after_scrub = False
         self.selected_clip_name_var.set("No source selected")
         self.selected_clip_duration_var.set("-")
         self.start_var.set("0.000")
@@ -689,6 +698,9 @@ class MainWindow:
             self.output_path_var.set(output_path_text)
 
     def _load_preview_for_clip(self, clip: SourceClip | ClipSegment) -> None:
+        self._cancel_pending_seek()
+        self._scrubbing_preview = False
+        self._resume_preview_after_scrub = False
         try:
             image = self.preview_player.load_clip(clip.preview_path, clip.duration_seconds or 0.0)
         except Exception as exc:  # noqa: BLE001
@@ -712,9 +724,33 @@ class MainWindow:
         if self._selected_source() is None and self._selected_clip() is None:
             return
 
+        self._cancel_pending_seek()
         self.preview_player.toggle()
         self.preview_state_var.set("Playing" if self.preview_player.is_playing else "Paused")
         self.play_pause_button.configure(text="Pause" if self.preview_player.is_playing else "Play")
+
+    def _on_playhead_press(self, _event: tk.Event[tk.Misc]) -> None:
+        self._scrubbing_preview = True
+        self._resume_preview_after_scrub = self.preview_player.is_playing
+        self._cancel_pending_seek()
+        self.preview_player.pause()
+        self.play_pause_button.configure(text="Play")
+        self.preview_state_var.set("Scrubbing")
+
+    def _on_playhead_release(self, _event: tk.Event[tk.Misc]) -> None:
+        self._scrubbing_preview = False
+        pending_seconds = self._pending_seek_seconds
+        self._cancel_pending_seek()
+        if pending_seconds is not None:
+            self._seek_preview(pending_seconds)
+        if self._resume_preview_after_scrub:
+            self.preview_player.play()
+            self.preview_state_var.set("Playing")
+            self.play_pause_button.configure(text="Pause")
+        else:
+            self.preview_state_var.set("Paused")
+            self.play_pause_button.configure(text="Play")
+        self._resume_preview_after_scrub = False
 
     def _on_playhead_changed(self, raw_value: str) -> None:
         if self._updating_playhead:
@@ -725,10 +761,33 @@ class MainWindow:
         except ValueError:
             return
 
+        if self.preview_player.uses_embedded_video:
+            self._pending_seek_seconds = seconds
+            if self._pending_seek_after_id is not None:
+                self.root.after_cancel(self._pending_seek_after_id)
+            self._pending_seek_after_id = self.root.after(75, self._flush_pending_seek)
+            self._set_playhead_value(seconds, self.preview_player.duration_seconds)
+            self.preview_state_var.set("Scrubbing")
+            self.play_pause_button.configure(text="Play")
+            return
+
         self.preview_player.pause()
         self.play_pause_button.configure(text="Play")
         self.preview_state_var.set("Scrubbing")
         self._seek_preview(seconds)
+
+    def _flush_pending_seek(self) -> None:
+        self._pending_seek_after_id = None
+        pending_seconds = self._pending_seek_seconds
+        if pending_seconds is None:
+            return
+        self._seek_preview(pending_seconds)
+
+    def _cancel_pending_seek(self) -> None:
+        self._pending_seek_seconds = None
+        if self._pending_seek_after_id is not None:
+            self.root.after_cancel(self._pending_seek_after_id)
+            self._pending_seek_after_id = None
 
     def _seek_preview(self, seconds: float) -> None:
         image = self.preview_player.seek(seconds)
@@ -963,7 +1022,7 @@ class MainWindow:
         image = self.preview_player.tick()
         if image is not None:
             self._set_preview_image(image)
-        if image is not None or self.preview_player.uses_embedded_video:
+        if (image is not None or self.preview_player.uses_embedded_video) and not self._scrubbing_preview:
             self._set_playhead_value(self.preview_player.playhead_seconds, self.preview_player.duration_seconds)
             self.preview_state_var.set("Playing" if self.preview_player.is_playing else "Paused")
             if not self.preview_player.is_playing:
@@ -1042,6 +1101,7 @@ class MainWindow:
             clip.proxy_error = source.proxy_error
 
     def _on_close(self) -> None:
+        self._cancel_pending_seek()
         self.preview_player.release()
         self.render_controller.shutdown()
         self.root.destroy()
