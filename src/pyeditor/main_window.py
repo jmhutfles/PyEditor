@@ -57,9 +57,15 @@ class MainWindow:
         self.render_progress_var = tk.DoubleVar(value=0.0)
         self.render_progress_label_var = tk.StringVar(value="Idle")
         self.proxy_status_var = tk.StringVar(value="No preview loaded")
+        self.proxy_queue_var = tk.StringVar(value="No proxy jobs queued")
+        self.proxy_window: tk.Toplevel | None = None
+        self.proxy_window_status_var = tk.StringVar(value="No proxy jobs queued")
+        self.proxy_rows_frame: ttk.Frame | None = None
+        self.proxy_row_vars: dict[str, tuple[tk.StringVar, tk.DoubleVar]] = {}
         self._last_progress_message = ""
 
         self._build_ui()
+        self._bind_shortcuts()
         self._poll_render_events()
         self._poll_proxy_events()
         self._poll_preview()
@@ -101,6 +107,39 @@ class MainWindow:
 
         status_bar = ttk.Label(self.root, textvariable=self.status_var, anchor="w", padding=(16, 8))
         status_bar.grid(row=1, column=0, sticky="ew")
+
+    def _bind_shortcuts(self) -> None:
+        self.root.bind_all("<KeyPress-i>", self._on_mark_in_shortcut)
+        self.root.bind_all("<KeyPress-I>", self._on_mark_in_shortcut)
+        self.root.bind_all("<KeyPress-o>", self._on_mark_out_shortcut)
+        self.root.bind_all("<KeyPress-O>", self._on_mark_out_shortcut)
+        self.root.bind_all("<KeyPress-a>", self._on_add_segment_shortcut)
+        self.root.bind_all("<KeyPress-A>", self._on_add_segment_shortcut)
+
+    def _should_handle_editor_shortcut(self) -> bool:
+        focused_widget = self.root.focus_get()
+        if focused_widget is None:
+            return True
+        entry_types = (tk.Entry, ttk.Entry, tk.Text)
+        return not isinstance(focused_widget, entry_types)
+
+    def _on_mark_in_shortcut(self, _event: tk.Event[tk.Misc]) -> str | None:
+        if not self._should_handle_editor_shortcut():
+            return None
+        self._set_start_from_playhead()
+        return "break"
+
+    def _on_mark_out_shortcut(self, _event: tk.Event[tk.Misc]) -> str | None:
+        if not self._should_handle_editor_shortcut():
+            return None
+        self._set_end_from_playhead()
+        return "break"
+
+    def _on_add_segment_shortcut(self, _event: tk.Event[tk.Misc]) -> str | None:
+        if not self._should_handle_editor_shortcut():
+            return None
+        self._add_segment_from_source()
+        return "break"
 
     def _sync_scroll_region(self, _event: tk.Event) -> None:
         self.content_canvas.configure(scrollregion=self.content_canvas.bbox("all"))
@@ -167,8 +206,8 @@ class MainWindow:
         preview_controls.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         self.play_pause_button = ttk.Button(preview_controls, text="Play", command=self._toggle_preview_playback)
         self.play_pause_button.pack(side="left")
-        ttk.Button(preview_controls, text="Mark In", command=self._set_start_from_playhead).pack(side="left", padx=(8, 0))
-        ttk.Button(preview_controls, text="Mark Out", command=self._set_end_from_playhead).pack(side="left", padx=(8, 0))
+        ttk.Button(preview_controls, text="Mark In (I)", command=self._set_start_from_playhead).pack(side="left", padx=(8, 0))
+        ttk.Button(preview_controls, text="Mark Out (O)", command=self._set_end_from_playhead).pack(side="left", padx=(8, 0))
         ttk.Button(preview_controls, text="Jump To In", command=lambda: self._jump_to_trim_edge("start")).pack(side="left", padx=(8, 0))
         ttk.Button(preview_controls, text="Jump To Out", command=lambda: self._jump_to_trim_edge("end")).pack(side="left", padx=(8, 0))
 
@@ -187,6 +226,7 @@ class MainWindow:
         source_button_row.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         ttk.Button(source_button_row, text="Add Clips", command=self._add_clips).pack(side="left")
         ttk.Button(source_button_row, text="Remove Source", command=self._remove_selected_source).pack(side="left", padx=(8, 0))
+        ttk.Button(source_button_row, text="Proxy Status", command=self._open_proxy_status_window).pack(side="left", padx=(8, 0))
 
         ttk.Label(sources_box, textvariable=self.drop_hint_var).grid(row=1, column=0, sticky="w", pady=(0, 8))
 
@@ -202,6 +242,7 @@ class MainWindow:
         source_scrollbar.grid(row=0, column=1, sticky="ns")
         self.source_listbox.configure(yscrollcommand=source_scrollbar.set)
         self._configure_drag_and_drop(sources_box, source_list_frame)
+        ttk.Label(sources_box, textvariable=self.proxy_queue_var).grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         segments_box = ttk.LabelFrame(media_frame, text="Edit Segments", padding=12)
         segments_box.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
@@ -210,7 +251,7 @@ class MainWindow:
 
         segment_button_row = ttk.Frame(segments_box)
         segment_button_row.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        ttk.Button(segment_button_row, text="Add Segment", command=self._add_segment_from_source).pack(side="left")
+        ttk.Button(segment_button_row, text="Add Segment (A)", command=self._add_segment_from_source).pack(side="left")
         ttk.Button(segment_button_row, text="Remove Segment", command=self._remove_selected_clip).pack(side="left", padx=(8, 0))
         ttk.Button(segment_button_row, text="Move Up", command=lambda: self._move_selected_clip(-1)).pack(side="left", padx=(8, 0))
         ttk.Button(segment_button_row, text="Move Down", command=lambda: self._move_selected_clip(1)).pack(side="left", padx=(8, 0))
@@ -245,7 +286,7 @@ class MainWindow:
 
         trim_button_row = ttk.Frame(trim_box)
         trim_button_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        ttk.Button(trim_button_row, text="Add Segment", command=self._add_segment_from_source).pack(side="left")
+        ttk.Button(trim_button_row, text="Add Segment (A)", command=self._add_segment_from_source).pack(side="left")
         ttk.Button(trim_button_row, text="Update Segment", command=self._apply_trim_values).pack(side="left", padx=(8, 0))
         ttk.Button(trim_button_row, text="Use Full Clip", command=self._use_full_clip).pack(side="left", padx=(8, 0))
 
@@ -352,9 +393,10 @@ class MainWindow:
             if existing_proxy is not None:
                 clip.proxy_path = existing_proxy
                 clip.proxy_status = "ready"
+                clip.proxy_progress = 1.0
             else:
                 clip.proxy_status = "queued"
-                self.proxy_controller.enqueue(str(clip_path))
+                self.proxy_controller.enqueue(str(clip_path), duration_seconds=duration_seconds)
             self.source_clips.append(clip)
             self.source_listbox.insert(tk.END, self._format_source_item_text(clip))
             added_any = True
@@ -374,6 +416,8 @@ class MainWindow:
         if not self.output_path_var.get() and self.source_clips:
             suggested_path = self.source_clips[0].source_path.with_name("edit-output.mp4")
             self.output_path_var.set(str(suggested_path))
+
+        self._update_proxy_queue_summary()
 
     def _configure_drag_and_drop(self, *widgets: tk.Misc) -> None:
         if not self.drag_and_drop_enabled or DND_FILES is None:
@@ -398,6 +442,8 @@ class MainWindow:
         self.source_listbox.delete(row)
         self.current_clips = [clip for clip in self.current_clips if clip.source_path != source.source_path]
         self._refresh_clip_list_text()
+        self._refresh_proxy_status_rows()
+        self._update_proxy_queue_summary()
 
         if self.source_clips:
             next_row = min(row, len(self.source_clips) - 1)
@@ -597,6 +643,7 @@ class MainWindow:
             self.output_path_var.set(output_path_text)
 
     def _load_preview_for_clip(self, clip: SourceClip | ClipSegment) -> None:
+        self._prioritize_proxy_for_clip(clip)
         try:
             image = self.preview_player.load_clip(clip.preview_path, clip.duration_seconds or 0.0)
         except Exception as exc:  # noqa: BLE001
@@ -611,7 +658,8 @@ class MainWindow:
         self.preview_duration_var.set(_format_seconds(self.preview_player.duration_seconds))
         self.play_pause_button.configure(text="Play")
         self._set_preview_image(image)
-        self._seek_preview(clip.start_seconds)
+        start_seconds = clip.start_seconds if isinstance(clip, ClipSegment) else 0.0
+        self._seek_preview(start_seconds)
 
     def _toggle_preview_playback(self) -> None:
         if self._selected_source() is None and self._selected_clip() is None:
@@ -823,16 +871,27 @@ class MainWindow:
         proxy_marker = " [proxy]" if clip.proxy_path is not None else ""
         return f"{clip.display_name}{proxy_marker} | {_format_seconds(clip.duration_seconds or 0.0)}"
 
-    def _format_proxy_status(self, clip: ClipSegment) -> str:
+    def _format_proxy_status(self, clip: SourceClip | ClipSegment) -> str:
         if clip.proxy_status == "ready" and clip.proxy_path is not None:
             return f"Preview source: proxy ({clip.proxy_path.name})"
         if clip.proxy_status == "building":
-            return "Preview source: original clip while proxy builds"
+            return f"Preview source: original clip while proxy builds ({clip.proxy_progress * 100:.0f}%)"
         if clip.proxy_status == "queued":
             return "Preview source: original clip, proxy queued"
         if clip.proxy_status == "failed":
             return f"Preview source: original clip, proxy failed: {clip.proxy_error or 'unknown error'}"
         return "Preview source: original clip"
+
+    def _proxy_status_label(self, clip: SourceClip) -> str:
+        if clip.proxy_status == "ready":
+            return "Ready"
+        if clip.proxy_status == "building":
+            return f"Building {clip.proxy_progress * 100:.0f}%"
+        if clip.proxy_status == "queued":
+            return "Queued"
+        if clip.proxy_status == "failed":
+            return f"Failed: {clip.proxy_error or 'unknown error'}"
+        return "Pending"
 
     def _append_log(self, message: str) -> None:
         self.log_output.configure(state="normal")
@@ -859,14 +918,23 @@ class MainWindow:
         self.root.after(150, self._poll_render_events)
 
     def _poll_proxy_events(self) -> None:
-        for event in self.proxy_controller.poll_events():
-            if event.name == "proxy_started":
-                self._on_proxy_started(event.args[0])
-            elif event.name == "proxy_finished":
-                self._on_proxy_finished(event.args[0], event.args[1])
-            elif event.name == "proxy_failed":
-                self._on_proxy_failed(event.args[0], event.args[1])
-        self.root.after(150, self._poll_proxy_events)
+        try:
+            for event in self.proxy_controller.poll_events():
+                try:
+                    if event.name == "proxy_started":
+                        self._on_proxy_started(event.args[0])
+                    elif event.name == "proxy_progress":
+                        self._on_proxy_progress(event.args[0], event.args[1])
+                    elif event.name == "proxy_finished":
+                        self._on_proxy_finished(event.args[0], event.args[1])
+                    elif event.name == "proxy_failed":
+                        self._on_proxy_failed(event.args[0], event.args[1])
+                    elif event.name == "queue_size_changed":
+                        self._on_proxy_queue_size_changed(event.args[0])
+                except Exception as exc:  # noqa: BLE001
+                    self._append_log(f"Proxy UI update failed: {exc}")
+        finally:
+            self.root.after(150, self._poll_proxy_events)
 
     def _poll_preview(self) -> None:
         image = self.preview_player.tick()
@@ -932,10 +1000,25 @@ class MainWindow:
         if clip is None:
             return
         clip.proxy_status = "building"
+        clip.proxy_progress = 0.0
         clip.proxy_error = None
         self._sync_segments_for_source(clip)
         self._refresh_source_list_text()
         self._refresh_clip_list_text()
+        self._refresh_proxy_status_rows()
+        self._update_proxy_queue_summary()
+        if clip == self._selected_source():
+            self.proxy_status_var.set(self._format_proxy_status(clip))
+
+    def _on_proxy_progress(self, source_path_text: str, fraction: float) -> None:
+        clip = self._find_source_by_path(Path(source_path_text))
+        if clip is None:
+            return
+        clip.proxy_status = "building"
+        clip.proxy_progress = max(0.0, min(float(fraction), 1.0))
+        clip.proxy_error = None
+        self._sync_segments_for_source(clip)
+        self._refresh_proxy_status_rows()
         if clip == self._selected_source():
             self.proxy_status_var.set(self._format_proxy_status(clip))
 
@@ -945,10 +1028,13 @@ class MainWindow:
             return
         clip.proxy_path = Path(proxy_path_text)
         clip.proxy_status = "ready"
+        clip.proxy_progress = 1.0
         clip.proxy_error = None
         self._sync_segments_for_source(clip)
         self._refresh_source_list_text()
         self._refresh_clip_list_text()
+        self._refresh_proxy_status_rows()
+        self._update_proxy_queue_summary()
         if clip == self._selected_source():
             current_position = self.preview_player.playhead_seconds
             was_playing = self.preview_player.is_playing
@@ -964,13 +1050,19 @@ class MainWindow:
         if clip is None:
             return
         clip.proxy_status = "failed"
+        clip.proxy_progress = 0.0
         clip.proxy_error = error
         self._sync_segments_for_source(clip)
         self._refresh_source_list_text()
         self._refresh_clip_list_text()
+        self._refresh_proxy_status_rows()
+        self._update_proxy_queue_summary()
         if clip == self._selected_source():
             self.proxy_status_var.set(self._format_proxy_status(clip))
         self._append_log(f"Proxy build failed for {clip.display_name}: {error}")
+
+    def _on_proxy_queue_size_changed(self, remaining_jobs: int) -> None:
+        self._update_proxy_queue_summary(remaining_jobs)
 
     def _find_source_by_path(self, source_path: Path) -> SourceClip | None:
         for clip in self.source_clips:
@@ -991,7 +1083,119 @@ class MainWindow:
             clip.duration_seconds = source.duration_seconds
             clip.proxy_path = source.proxy_path
             clip.proxy_status = source.proxy_status
+            clip.proxy_progress = source.proxy_progress
             clip.proxy_error = source.proxy_error
+
+    def _prioritize_proxy_for_clip(self, clip: SourceClip | ClipSegment) -> None:
+        source = clip if isinstance(clip, SourceClip) else self._find_source_by_path(clip.source_path)
+        if source is None or source.proxy_path is not None or source.proxy_status == "failed":
+            return
+        self.proxy_controller.enqueue(
+            str(source.source_path),
+            duration_seconds=source.duration_seconds,
+            prioritize=True,
+        )
+        self._update_proxy_queue_summary()
+
+    def _open_proxy_status_window(self) -> None:
+        if self.proxy_window is not None and self.proxy_window.winfo_exists():
+            self.proxy_window.deiconify()
+            self.proxy_window.lift()
+            self.proxy_window.focus_force()
+            return
+
+        self.proxy_window = tk.Toplevel(self.root)
+        self.proxy_window.title("Proxy Status")
+        self.proxy_window.geometry("720x420")
+        self.proxy_window.protocol("WM_DELETE_WINDOW", self.proxy_window.withdraw)
+        self.proxy_window.columnconfigure(0, weight=1)
+        self.proxy_window.rowconfigure(1, weight=1)
+
+        ttk.Label(self.proxy_window, textvariable=self.proxy_window_status_var, padding=(12, 12, 12, 0)).grid(
+            row=0, column=0, sticky="ew"
+        )
+
+        container = ttk.Frame(self.proxy_window, padding=12)
+        container.grid(row=1, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.proxy_rows_frame = ttk.Frame(canvas)
+        self.proxy_rows_frame.columnconfigure(0, weight=3)
+        self.proxy_rows_frame.columnconfigure(1, weight=2)
+        self.proxy_rows_frame.columnconfigure(2, weight=3)
+        self.proxy_rows_frame.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        window_id = canvas.create_window((0, 0), window=self.proxy_rows_frame, anchor="nw")
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window_id, width=event.width))
+        self.proxy_row_vars = {}
+
+        self._refresh_proxy_status_rows()
+        self._update_proxy_queue_summary()
+
+    def _refresh_proxy_status_rows(self) -> None:
+        if self.proxy_rows_frame is None:
+            return
+
+        if not self.proxy_rows_frame.winfo_exists():
+            self.proxy_rows_frame = None
+            self.proxy_row_vars = {}
+            return
+
+        existing_keys = {str(clip.source_path) for clip in self.source_clips}
+        for source_path_text in list(self.proxy_row_vars):
+            if source_path_text not in existing_keys:
+                self.proxy_row_vars.pop(source_path_text, None)
+
+        for child in self.proxy_rows_frame.winfo_children():
+            child.destroy()
+
+        for row, clip in enumerate(self.source_clips):
+            source_path_text = str(clip.source_path)
+            row_vars = self.proxy_row_vars.get(source_path_text)
+            if row_vars is None:
+                row_vars = (tk.StringVar(), tk.DoubleVar())
+                self.proxy_row_vars[source_path_text] = row_vars
+            status_var, progress_var = row_vars
+            status_var.set(self._proxy_status_label(clip))
+            progress_var.set(max(0.0, min(clip.proxy_progress * 100.0, 100.0)))
+
+            ttk.Label(self.proxy_rows_frame, text=clip.display_name).grid(row=row, column=0, sticky="w", pady=(0, 8))
+            ttk.Label(self.proxy_rows_frame, textvariable=status_var).grid(
+                row=row,
+                column=1,
+                sticky="w",
+                padx=(12, 12),
+                pady=(0, 8),
+            )
+            progressbar = ttk.Progressbar(
+                self.proxy_rows_frame,
+                orient="horizontal",
+                mode="determinate",
+                maximum=100.0,
+                variable=progress_var,
+            )
+            progressbar.grid(row=row, column=2, sticky="ew", pady=(0, 8))
+
+    def _update_proxy_queue_summary(self, remaining_jobs: int | None = None) -> None:
+        if remaining_jobs is None:
+            remaining_jobs = self.proxy_controller.queue_size
+
+        total_count = len(self.source_clips)
+        if total_count == 0:
+            summary = "No proxy jobs queued"
+        else:
+            building_count = sum(1 for clip in self.source_clips if clip.proxy_status == "building")
+            ready_count = sum(1 for clip in self.source_clips if clip.proxy_status == "ready")
+            summary = f"Proxy jobs: {building_count} building, {remaining_jobs} queued, {ready_count}/{total_count} ready"
+
+        self.proxy_queue_var.set(summary)
+        self.proxy_window_status_var.set(summary)
 
     def _on_close(self) -> None:
         self.preview_player.release()

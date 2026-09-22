@@ -11,6 +11,7 @@ class SourceClip:
     duration_seconds: float | None = None
     proxy_path: Path | None = None
     proxy_status: str = "pending"
+    proxy_progress: float = 0.0
     proxy_error: str | None = None
 
     @property
@@ -32,6 +33,7 @@ class ClipSegment:
     duration_seconds: float | None = None
     proxy_path: Path | None = None
     proxy_status: str = "pending"
+    proxy_progress: float = 0.0
     proxy_error: str | None = None
 
     @property
